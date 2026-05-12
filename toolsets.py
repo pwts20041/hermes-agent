@@ -274,6 +274,27 @@ TOOLSETS = {
         ],
         "includes": []
     },
+
+    "hermes-colaclaw": {
+        "description": "ColaClaw SaaS bridge — same tool surface as API server (Phase 1 text transport)",
+        "tools": [
+            "web_search", "web_extract",
+            "terminal", "process",
+            "read_file", "write_file", "patch", "search_files",
+            "vision_analyze", "image_generate",
+            "skills_list", "skill_view", "skill_manage",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console",
+            "todo", "memory",
+            "session_search",
+            "execute_code", "delegate_task",
+            "cronjob",
+            "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+        ],
+        "includes": []
+    },
     
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",

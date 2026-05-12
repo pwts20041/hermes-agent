@@ -771,8 +771,11 @@ def merge_pending_message_event(
                     existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
                 else:
                     existing.text = event.text
-            if existing_is_photo or incoming_is_photo:
-                existing.message_type = MessageType.PHOTO
+            from gateway.inbound_attachment_context import (
+                normalize_message_type_for_media,
+            )
+
+            normalize_message_type_for_media(existing)
             return
 
         if (
@@ -866,6 +869,9 @@ class BasePlatformAdapter(ABC):
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # ColaClaw (and similar): last media-bearing inbound while a turn is still
+        # active, so a fast text-only follow-up during processing can reuse paths.
+        self._in_flight_media_bundle: Dict[str, tuple[list[str], list[str], MessageType, float]] = {}
         # Background message-processing tasks spawned by handle_message().
         # Gateway shutdown cancels these so an old gateway instance doesn't keep
         # working on a task after --replace or manual restarts.
@@ -1613,6 +1619,47 @@ class BasePlatformAdapter(ABC):
                 merge_pending_message_event(self._pending_messages, session_key, event)
                 return  # Don't interrupt now - will run after current task completes
 
+            existing_pending = self._pending_messages.get(session_key)
+            if existing_pending and existing_pending.media_urls and not event.media_urls:
+                merge_pending_message_event(
+                    self._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=True,
+                )
+                logger.debug(
+                    "[%s] Merged text-only follow-up into pending media event for %s",
+                    self.name,
+                    session_key,
+                )
+                self._active_sessions[session_key].set()
+                return
+
+            if (
+                event.source.platform == Platform.COLACLAW
+                and not event.media_urls
+                and (event.text or "").strip()
+            ):
+                import time as _time
+
+                bundle = self._in_flight_media_bundle.get(session_key)
+                if bundle is not None:
+                    urls, types, mt, ts = bundle
+                    if _time.time() - ts <= 120.0:
+                        event.media_urls = list(urls)
+                        event.media_types = list(types)
+                        event.message_type = mt
+                        self._in_flight_media_bundle.pop(session_key, None)
+                        from gateway.inbound_attachment_context import (
+                            normalize_message_type_for_media,
+                        )
+
+                        normalize_message_type_for_media(event)
+                        logger.debug(
+                            "[%s] ColaClaw text interrupt reused in-flight media bundle",
+                            self.name,
+                        )
+
             # Default behavior for non-photo follow-ups: interrupt the running agent
             logger.debug("[%s] New message while session %s is active — triggering interrupt", self.name, session_key)
             self._pending_messages[session_key] = event
@@ -1679,9 +1726,21 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+
+        import time as _time
+
+        if event.media_urls:
+            self._in_flight_media_bundle[session_key] = (
+                list(event.media_urls),
+                list(event.media_types),
+                event.message_type,
+                _time.time(),
+            )
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        if event.source.platform == Platform.COLACLAW:
+            _thread_metadata = {**(_thread_metadata or {}), "hermes_outbound_kind": "message"}
         typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
         
         try:
@@ -1887,6 +1946,13 @@ class BasePlatformAdapter(ABC):
                 ProcessingOutcome.SUCCESS if processing_ok else ProcessingOutcome.FAILURE,
             )
 
+            _turn_hook = getattr(self, "emit_turn_completion_marker", None)
+            if callable(_turn_hook):
+                try:
+                    await _turn_hook(event.source.chat_id, ok=processing_ok)
+                except Exception as _tc_err:
+                    logger.debug("[%s] emit_turn_completion_marker: %s", self.name, _tc_err)
+
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
                 pending_event = self._pending_messages.pop(session_key)
@@ -1902,6 +1968,8 @@ class BasePlatformAdapter(ABC):
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up
+
+            self._in_flight_media_bundle.pop(session_key, None)
                 
         except asyncio.CancelledError:
             current_task = asyncio.current_task()
@@ -1917,7 +1985,12 @@ class BasePlatformAdapter(ABC):
             try:
                 error_type = type(e).__name__
                 error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                _thread_metadata_err = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                if event.source.platform == Platform.COLACLAW:
+                    _thread_metadata_err = {
+                        **(_thread_metadata_err or {}),
+                        "hermes_outbound_kind": "error",
+                    }
                 await self.send(
                     chat_id=event.source.chat_id,
                     content=(
@@ -1925,7 +1998,7 @@ class BasePlatformAdapter(ABC):
                         f"{error_detail}\n"
                         "Try again or use /reset to start a fresh session."
                     ),
-                    metadata=_thread_metadata,
+                    metadata=_thread_metadata_err,
                 )
             except Exception:
                 pass  # Last resort — don't let error reporting crash the handler
@@ -1971,6 +2044,7 @@ class BasePlatformAdapter(ABC):
         self._expected_cancelled_tasks.clear()
         self._pending_messages.clear()
         self._active_sessions.clear()
+        self._in_flight_media_bundle.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:
         """Check if there's a pending interrupt for a session."""

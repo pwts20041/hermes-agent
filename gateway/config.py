@@ -60,6 +60,7 @@ class Platform(Enum):
     SMS = "sms"
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
+    COLACLAW = "colaclaw"
     WEBHOOK = "webhook"
     FEISHU = "feishu"
     WECOM = "wecom"
@@ -112,7 +113,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "webhook", "colaclaw")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -136,7 +137,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=notify if notify is not None else True,
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook", "colaclaw"),
         )
 
 
@@ -289,6 +290,9 @@ class GatewayConfig:
                 connected.append(platform)
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
+                connected.append(platform)
+            # ColaClaw HTTP ingress + callback (secret optional for local dev)
+            elif platform == Platform.COLACLAW:
                 connected.append(platform)
             # Feishu uses extra dict for app credentials
             elif platform == Platform.FEISHU and config.extra.get("app_id"):
@@ -989,6 +993,31 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # ColaClaw (SaaS bridge) — HTTP ingress + outbound callback
+    colaclaw_enabled = os.getenv("COLACLAW_ENABLED", "").lower() in ("true", "1", "yes")
+    colaclaw_secret = os.getenv("COLACLAW_SECRET", "")
+    colaclaw_callback = os.getenv("COLACLAW_CALLBACK_URL", "").strip()
+    colaclaw_port = os.getenv("COLACLAW_PORT")
+    colaclaw_host = os.getenv("COLACLAW_HOST", "").strip()
+    if colaclaw_enabled:
+        if Platform.COLACLAW not in config.platforms:
+            config.platforms[Platform.COLACLAW] = PlatformConfig()
+        config.platforms[Platform.COLACLAW].enabled = True
+        if colaclaw_secret:
+            config.platforms[Platform.COLACLAW].extra["secret"] = colaclaw_secret
+        if colaclaw_callback:
+            config.platforms[Platform.COLACLAW].extra["callback_url"] = colaclaw_callback
+        if colaclaw_port:
+            try:
+                config.platforms[Platform.COLACLAW].extra["port"] = int(colaclaw_port)
+            except ValueError:
+                pass
+        if colaclaw_host:
+            config.platforms[Platform.COLACLAW].extra["host"] = colaclaw_host
+        colaclaw_schema = os.getenv("COLACLAW_CALLBACK_SCHEMA", "").strip()
+        if colaclaw_schema:
+            config.platforms[Platform.COLACLAW].extra["callback_schema"] = colaclaw_schema
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in ("true", "1", "yes")

@@ -354,7 +354,8 @@ def _build_media_placeholder(event) -> str:
     media_urls = getattr(event, "media_urls", None) or []
     media_types = getattr(event, "media_types", None) or []
     for i, url in enumerate(media_urls):
-        mtype = media_types[i] if i < len(media_types) else ""
+        mtype_raw = media_types[i] if i < len(media_types) else ""
+        mtype = (mtype_raw or "").strip().split(";")[0].strip().lower()
         if mtype.startswith("image/") or getattr(event, "message_type", None) == MessageType.PHOTO:
             parts.append(f"[User sent an image: {url}]")
         elif mtype.startswith("audio/"):
@@ -534,6 +535,19 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         return text
 
     return None
+
+
+def _should_offer_home_channel_onboarding(platform: Optional[Platform]) -> bool:
+    """Whether first-turn /sethome nags apply.
+
+    ColaClaw is SaaS HTTP ingress + callbacks — there is no stable gateway
+    ``home channel`` to register; /sethome would only confuse users.
+    """
+    if platform is None:
+        return False
+    if platform in (Platform.LOCAL, Platform.WEBHOOK, Platform.COLACLAW):
+        return False
+    return True
 
 
 class GatewayRunner:
@@ -2537,6 +2551,13 @@ class GatewayRunner:
                 return None
             return APIServerAdapter(config)
 
+        elif platform == Platform.COLACLAW:
+            from gateway.platforms.colaclaw import ColaClawAdapter, check_colaclaw_requirements
+            if not check_colaclaw_requirements():
+                logger.warning("ColaClaw: aiohttp not installed")
+                return None
+            return ColaClawAdapter(config)
+
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
             if not check_webhook_requirements():
@@ -2578,7 +2599,7 @@ class GatewayRunner:
         # connection, so HA events are always authorized.
         # Webhook events are authenticated via HMAC signature validation in
         # the adapter itself — no user allowlist applies.
-        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK):
+        if source.platform in (Platform.HOMEASSISTANT, Platform.WEBHOOK, Platform.COLACLAW):
             return True
 
         user_id = source.user_id
@@ -3289,6 +3310,29 @@ class GatewayRunner:
         history = history or []
         message_text = event.text or ""
 
+        from gateway.inbound_attachment_context import (
+            build_current_turn_attachments_preamble,
+            normalize_message_type_for_media,
+            safe_attachment_log_dict,
+        )
+
+        normalize_message_type_for_media(event)
+        if event.media_urls:
+            _log_att = safe_attachment_log_dict(event)
+            logger.info(
+                "[attachment_context] platform=%s attachment_context_count=%s "
+                "attachment_context_paths_count=%s attachment_context_types=%s "
+                "agent_context_includes_attachments=%s",
+                source.platform.value if source.platform else "",
+                _log_att["attachment_context_count"],
+                _log_att["attachment_context_paths_count"],
+                ",".join(_log_att["attachment_context_types"]),
+                _log_att["agent_context_includes_attachments"],
+            )
+            _plat = source.platform.value if source.platform else "unknown"
+            _pre = build_current_turn_attachments_preamble(event, platform_key=_plat)
+            message_text = f"{_pre}\n\n{message_text}"
+
         _is_shared_thread = (
             source.chat_type != "dm"
             and source.thread_id
@@ -3301,16 +3345,31 @@ class GatewayRunner:
             image_paths = []
             audio_paths = []
             for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                mtype_raw = event.media_types[i] if i < len(event.media_types) else ""
+                mtype = (mtype_raw or "").strip().split(";")[0].strip().lower()
                 if mtype.startswith("image/") or event.message_type == MessageType.PHOTO:
                     image_paths.append(path)
                 if mtype.startswith("audio/") or event.message_type in (MessageType.VOICE, MessageType.AUDIO):
                     audio_paths.append(path)
 
+            pl = source.platform.value if source.platform else ""
+            logger.info(
+                "[media_inbound] platform=%s message_type=%s media_urls=%d "
+                "image_paths=%d audio_paths=%d will_auto_vision=%s will_auto_stt=%s",
+                pl,
+                event.message_type.value,
+                len(event.media_urls),
+                len(image_paths),
+                len(audio_paths),
+                bool(image_paths),
+                bool(audio_paths),
+            )
+
             if image_paths:
                 message_text = await self._enrich_message_with_vision(
                     message_text,
                     image_paths,
+                    platform=source.platform,
                 )
 
             if audio_paths:
@@ -3352,7 +3411,8 @@ class GatewayRunner:
 
             _TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml", ".toml", ".ini", ".cfg"}
             for i, path in enumerate(event.media_urls):
-                mtype = event.media_types[i] if i < len(event.media_types) else ""
+                mtype_raw = event.media_types[i] if i < len(event.media_types) else ""
+                mtype = (mtype_raw or "").strip().split(";")[0].strip().lower()
                 if mtype in ("", "application/octet-stream"):
                     import os as _os2
 
@@ -3379,6 +3439,19 @@ class GatewayRunner:
                         f"[The user sent a text document: '{display_name}'. "
                         f"Its content has been included below. "
                         f"The file is also saved at: {path}]"
+                    )
+                elif source.platform == Platform.COLACLAW:
+                    # ColaClaw web: user file is not in the Hermes repo — weak wording
+                    # caused models to "search workspace" for unrelated PDFs instead.
+                    context_note = (
+                        f"[ColaClaw user attachment — document '{display_name}' "
+                        f"(MIME {mtype}); gateway cache path: {path}. "
+                        f"The user's message below refers to THIS file only. "
+                        f"If they ask to summarize, extract, or analyze it, use tools on "
+                        f"that path (for PDF and other opaque binaries, try vision_analyze "
+                        f"with image_url set to this path when read_file cannot read it). "
+                        f"Do not substitute PDFs or specs from ./docs, ./skills, or the "
+                        f"Hermes source tree unless the user explicitly names those paths.]"
                     )
                 else:
                     context_note = (
@@ -3837,8 +3910,8 @@ class GatewayRunner:
             )
         
         # One-time prompt if no home channel is set for this platform
-        # Skip for webhooks - they deliver directly to configured targets (github_comment, etc.)
-        if not history and source.platform and source.platform != Platform.LOCAL and source.platform != Platform.WEBHOOK:
+        # Skip for webhooks (direct-to-target) and ColaClaw (no /sethome concept).
+        if not history and _should_offer_home_channel_onboarding(source.platform):
             platform_name = source.platform.value
             env_key = f"{platform_name.upper()}_HOME_CHANNEL"
             if not os.getenv(env_key):
@@ -3897,9 +3970,23 @@ class GatewayRunner:
             await self.hooks.emit("agent:start", hook_ctx)
 
             # Run the agent
+            from gateway.inbound_attachment_context import (
+                build_attachment_priority_system_note,
+            )
+
+            _ctx_prompt = context_prompt
+            if event.media_urls:
+                _ctx_prompt = (
+                    build_attachment_priority_system_note(
+                        attachment_count=len(event.media_urls),
+                        platform_key=_platform_name,
+                    )
+                    + "\n\n"
+                    + context_prompt
+                )
             agent_result = await self._run_agent(
                 message=message_text,
-                context_prompt=context_prompt,
+                context_prompt=_ctx_prompt,
                 history=history,
                 source=source,
                 session_id=session_entry.session_id,
@@ -7361,6 +7448,8 @@ class GatewayRunner:
         self,
         user_text: str,
         image_paths: List[str],
+        *,
+        platform: Optional[Platform] = None,
     ) -> str:
         """
         Auto-analyze user-attached images with the vision tool and prepend
@@ -7374,11 +7463,16 @@ class GatewayRunner:
         Args:
             user_text:   The user's original caption / message text.
             image_paths: List of local file paths to cached images.
+            platform:    Messaging platform (for source-aware fallback text).
 
         Returns:
             The enriched message string with vision descriptions prepended.
         """
         from tools.vision_tools import vision_analyze_tool
+        from gateway.platforms.colaclaw.vision_context import (
+            attachment_source_label_for_vision,
+        )
+
         import json as _json
 
         analysis_prompt = (
@@ -7387,7 +7481,11 @@ class GatewayRunner:
             "and any other notable visual information."
         )
 
+        attach_src = attachment_source_label_for_vision(platform)
+
         enriched_parts = []
+        vision_ok = 0
+        vision_failed = 0
         for path in image_paths:
             try:
                 logger.debug("Auto-analyzing user image: %s", path)
@@ -7397,6 +7495,7 @@ class GatewayRunner:
                 )
                 result = _json.loads(result_json)
                 if result.get("success"):
+                    vision_ok += 1
                     description = result.get("analysis", "")
                     enriched_parts.append(
                         f"[The user sent an image~ Here's what I can see:\n{description}]\n"
@@ -7404,18 +7503,29 @@ class GatewayRunner:
                         f"image_url: {path} ~]"
                     )
                 else:
+                    vision_failed += 1
                     enriched_parts.append(
-                        "[The user sent an image but I couldn't quite see it "
+                        f"[The user sent an image via {attach_src} but I couldn't quite see it "
                         "this time (>_<) You can try looking at it yourself "
                         f"with vision_analyze using image_url: {path}]"
                     )
             except Exception as e:
+                vision_failed += 1
                 logger.error("Vision auto-analysis error: %s", e)
                 enriched_parts.append(
-                    f"[The user sent an image but something went wrong when I "
+                    f"[The user sent an image via {attach_src} but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
                     f"with vision_analyze using image_url: {path}]"
                 )
+
+        logger.info(
+            "[vision_auto] platform=%s images=%d vision_ok=%d vision_failed=%d "
+            "(eager preprocess; not gateway /approve)",
+            platform.value if platform else "?",
+            len(image_paths),
+            vision_ok,
+            vision_failed,
+        )
 
         # Combine: vision descriptions first, then the user's original text
         if enriched_parts:
@@ -8260,7 +8370,12 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _pm: Dict[str, Any] = {}
+        if _progress_thread_id:
+            _pm["thread_id"] = _progress_thread_id
+        if source.platform == Platform.COLACLAW:
+            _pm["hermes_outbound_kind"] = "progress"
+        _progress_metadata = _pm if _pm else None
 
         async def send_progress_messages():
             if not progress_queue:
@@ -8421,7 +8536,12 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _sm_status: Dict[str, Any] = {}
+        if _progress_thread_id:
+            _sm_status["thread_id"] = _progress_thread_id
+        if source.platform == Platform.COLACLAW:
+            _sm_status["hermes_outbound_kind"] = "status"
+        _status_thread_metadata = _sm_status if _sm_status else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter:
@@ -8795,6 +8915,14 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+
+                logger.info(
+                    "[gateway_approval] adapter=%s cmd_len=%d desc_preview=%s uses_buttons=%s",
+                    type(_status_adapter).__name__,
+                    len(cmd or ""),
+                    (desc or "")[:120],
+                    getattr(type(_status_adapter), "send_exec_approval", None) is not None,
+                )
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -9465,16 +9593,37 @@ class GatewayRunner:
                     except Exception:
                         pass
 
+                from gateway.inbound_attachment_context import (
+                    build_attachment_priority_system_note,
+                )
+
+                _follow_ctx = context_prompt
+                if pending_event and pending_event.media_urls:
+                    _follow_ctx = (
+                        build_attachment_priority_system_note(
+                            attachment_count=len(pending_event.media_urls),
+                            platform_key=(
+                                next_source.platform.value
+                                if next_source.platform
+                                else "unknown"
+                            ),
+                        )
+                        + "\n\n"
+                        + context_prompt
+                    )
+
                 return await self._run_agent(
                     message=next_message,
-                    context_prompt=context_prompt,
+                    context_prompt=_follow_ctx,
                     history=updated_history,
                     source=next_source,
                     session_id=session_id,
                     session_key=session_key,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
-                    channel_prompt=pending_event.channel_prompt,
+                    channel_prompt=(
+                        pending_event.channel_prompt if pending_event else None
+                    ),
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task
